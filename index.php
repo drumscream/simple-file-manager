@@ -15,9 +15,11 @@ $allow_upload = true; // Set to true to allow upload files
 $allow_create_folder = true; // Set to false to disable folder creation
 $allow_direct_link = true; // Set to false to only allow downloads and not direct link
 $allow_show_folders = true; // Set to false to hide all subdirectories
+$sort_folders_first = true; // Set to true if you want to show folders first in directory listing
+$ignore_file_case = true; // Set to true if you want to ignore case when listing files
 
 $disallowed_extensions = ['php'];  // must be an array. Extensions disallowed to be uploaded
-$hidden_extensions = ['php']; // must be an array of lowercase file extensions. Extensions hidden in directory index
+$hidden_extensions = ['php','gitignore','gitattributes','git']; // must be an array of lowercase file extensions. Extensions hidden in directory index
 
 $PASSWORD = '';  // Set the password, to access the file manager... (optional)
 
@@ -37,7 +39,7 @@ if($PASSWORD) {
 }
 
 // must be in UTF-8 or `basename` doesn't work
-setlocale(LC_ALL,'en_US.UTF-8');
+setlocale(LC_ALL,'ru_RU.UTF-8');
 
 $tmp_dir = dirname($_SERVER['SCRIPT_FILENAME']);
 if(DIRECTORY_SEPARATOR==='\\') $tmp_dir = str_replace('/',DIRECTORY_SEPARATOR,$tmp_dir);
@@ -47,9 +49,10 @@ if($tmp === false)
 	err(404,'File or Directory Not Found');
 if(substr($tmp, 0,strlen($tmp_dir)) !== $tmp_dir)
 	err(403,"Forbidden");
-if(strpos($_REQUEST['file'], DIRECTORY_SEPARATOR) === 0)
+if (!is_array($_REQUEST['file'])) {
+	if(strpos($_REQUEST['file'], DIRECTORY_SEPARATOR) === 0)
 	err(403,"Forbidden");
-
+}
 
 if(!$_COOKIE['_sfm_xsrf'])
 	setcookie('_sfm_xsrf',bin2hex(openssl_random_pseudo_bytes(16)));
@@ -64,7 +67,21 @@ if($_GET['do'] == 'list') {
 		$directory = $file;
 		$result = [];
 		$files = array_diff(scandir($directory), ['.','..']);
-		foreach ($files as $entry) if (!is_entry_ignored($entry, $allow_show_folders, $hidden_extensions)) {
+		$directories = [];
+		$files_in_dir = [];
+		if ($sort_folders_first) {
+			foreach ($files as $unsorted) {
+				if(is_dir($directory.'/'.$unsorted)) $directories[] = $unsorted;
+				else $files_in_dir[] = $unsorted;
+			}
+			if ($ignore_file_case) {
+				uasort($directories, 'strcasecmp');
+				uasort($files_in_dir, 'strcasecmp');
+			}
+			$sorted_files = array_merge($directories, $files_in_dir);
+		}
+		else $sorted_files = $files; 
+		foreach ($sorted_files as $entry) if (!is_entry_ignored($entry, $allow_show_folders, $hidden_extensions)) {
 		$i = $directory . '/' . $entry;
 		$stat = stat($i);
 	        $result[] = [
@@ -87,7 +104,13 @@ if($_GET['do'] == 'list') {
 	exit;
 } elseif ($_POST['do'] == 'delete') {
 	if($allow_delete) {
-		rmrf($file);
+		if (!is_array($file)) {
+			rmrf($file);
+		} else {
+			foreach ($file as $kf => $sfile) {
+				rmrf($sfile);
+			}
+		}
 	}
 	exit;
 } elseif ($_POST['do'] == 'mkdir' && $allow_create_folder) {
@@ -103,11 +126,25 @@ if($_GET['do'] == 'list') {
 	foreach($disallowed_extensions as $ext)
 		if(preg_match(sprintf('/\.%s$/',preg_quote($ext)), $_FILES['file_data']['name']))
 			err(403,"Files of this type are not allowed.");
-
 	$res = move_uploaded_file($_FILES['file_data']['tmp_name'], $file.'/'.$_FILES['file_data']['name']);
+	
+	// сжимаем картинки
+	if($_POST['piccompress'] == 'True') {
+		$ext = strtolower(pathinfo($_FILES['file_data']['name'], PATHINFO_EXTENSION));
+		if (($ext == 'jpg') or ($ext == 'jpeg')) {
+			$picture = '"'.$tmp_dir.'/'.$file.'/'.$_FILES['file_data']['name'].'"'; // полный путь к файлу, обрамлённый кавычками на случай пробелов в пути
+			exec("jpegoptim -s -m50 $picture");
+		}
+	}
 	exit;
 } elseif ($_GET['do'] == 'download') {
 	$filename = basename($file);
+	if (is_dir($file)) {
+		$zipFilename = tempnam(sys_get_temp_dir(), 'sfm');
+		zipDir(realpath($file), $zipFilename);
+		$file = $zipFilename;
+		$filename .= '.zip';
+	}
 	$finfo = finfo_open(FILEINFO_MIME_TYPE);
 	header('Content-Type: ' . finfo_file($finfo, $file));
 	header('Content-Length: '. filesize($file));
@@ -115,6 +152,9 @@ if($_GET['do'] == 'list') {
 		strpos('MSIE',$_SERVER['HTTP_REFERER']) ? rawurlencode($filename) : "\"$filename\"" ));
 	ob_flush();
 	readfile($file);
+	if (isset($zipFilename)) {
+		unlink($zipFilename);
+	}
 	exit;
 }
 
@@ -145,6 +185,7 @@ function rmrf($dir) {
 		unlink($dir);
 	}
 }
+
 function is_recursively_deleteable($d) {
 	$stack = [$d];
 	while($dir = array_pop($stack)) {
@@ -158,7 +199,6 @@ function is_recursively_deleteable($d) {
 	return true;
 }
 
-// from: http://php.net/manual/en/function.realpath.php#84012
 function get_absolute_path($path) {
         $path = str_replace(['/', '\\'], DIRECTORY_SEPARATOR, $path);
         $parts = explode(DIRECTORY_SEPARATOR, $path);
@@ -186,23 +226,51 @@ function asBytes($ini_v) {
 	return intval($ini_v) * ($s[strtolower(substr($ini_v,-1))] ?: 1);
 }
 $MAX_UPLOAD_SIZE = min(asBytes(ini_get('post_max_size')), asBytes(ini_get('upload_max_filesize')));
+
+function folderToZip($folder, &$zipFile, $exclusiveLength) {
+    $handle = opendir($folder);
+    while (false !== $f = readdir($handle)) {
+        if ($f != '.' && $f != '..') {
+            $filePath = "$folder/$f";
+            // Remove prefix from file path before add to zip.
+            $localPath = substr($filePath, $exclusiveLength);
+        if (is_file($filePath)) {
+            $zipFile->addFile($filePath, $localPath);
+        } elseif (is_dir($filePath)) {
+            // Add sub-directory.
+            $zipFile->addEmptyDir($localPath);
+            folderToZip($filePath, $zipFile, $exclusiveLength);
+        }
+      }
+    }
+    closedir($handle);
+}
+
+function zipDir($sourcePath, $outZipPath) {
+    $pathInfo = pathInfo($sourcePath);
+    $parentPath = $pathInfo['dirname'];
+    $dirName = $pathInfo['basename'];
+    $z = new ZipArchive();
+    $z->open($outZipPath, ZIPARCHIVE::CREATE);
+    $z->addEmptyDir($dirName);
+    folderToZip($sourcePath, $z, strlen("$parentPath/"));
+    $z->close();
+}
 ?>
 <!DOCTYPE html>
 <html><head>
+<title>DrumScream File Manager</title>
+<link rel="icon" type="image/x-icon" href="data:image/x-icon;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAnUlEQVQ4jWPc3+DA8vHj69rPv9nsGZAAL+uf4wH9lysZCACWjx9f1554IluHRc5+bT6DYPDEyxn4DGBCtxkZXH0tlrq1VNUAnwGMf6ezNDAy/q8n5FRMnQxnGX/99WMiWSMM/GcwZmBjiiTfAAYGhn//mHgpMoCBgYFh1IDhYQATw/8z5Gv+f5qF4eXfbYySzD7//jGakqqZ4fnf7QCbLTGxlyUZIQAAAABJRU5ErkJggg==" />
 <meta http-equiv="content-type" content="text/html; charset=utf-8">
-
 <style>
 body {font-family: "lucida grande","Segoe UI",Arial, sans-serif; font-size: 14px;width:1024;padding:1em;margin:0;}
-th {font-weight: normal; color: #1F75CC; background-color: #F0F9FF; padding:.5em 1em .5em .2em;
-	text-align: left;cursor:pointer;user-select: none;}
+th {font-weight: normal; color: #1F75CC; background-color: #F0F9FF; padding:.5em 1em .5em .2em;	text-align: left;cursor:pointer;user-select: none;}
 th .indicator {margin-left: 6px }
-thead {border-top: 1px solid #82CFFA; border-bottom: 1px solid #96C4EA;border-left: 1px solid #E7F2FB;
-	border-right: 1px solid #E7F2FB; }
+thead {border-top: 1px solid #82CFFA; border-bottom: 1px solid #96C4EA;border-left: 1px solid #E7F2FB; border-right: 1px solid #E7F2FB;}
 #top {height:52px;}
-#mkdir {display:inline-block;float:right;padding-top:16px;}
-label { display:block; font-size:11px; color:#555;}
-#file_drop_target {width:500px; padding:12px 0; border: 4px dashed #ccc;font-size:12px;color:#ccc;
-	text-align: center;float:right;margin-right:20px;}
+#mkdir {display:inline-block;float:right;/* padding-top:16px; */}
+label {display:block; font-size:11px; color:#555;}
+#file_drop_target {width:50%; padding:12px 0; border: 4px dashed #ccc;font-size:12px;color:#ccc;text-align:center;float:right;margin-right:20px;margin-bottom:-34px;}
 #file_drop_target.drag_over {border: 4px dashed #96C4EA; color: #96C4EA;}
 #upload_progress {padding: 4px 0;}
 #upload_progress .error {color:#a00;}
@@ -210,21 +278,22 @@ label { display:block; font-size:11px; color:#555;}
 .no_write #mkdir, .no_write #file_drop_target {display: none}
 .progress_track {display:inline-block;width:200px;height:10px;border:1px solid #333;margin: 0 4px 0 10px;}
 .progress {background-color: #82CFFA;height:10px; }
-footer {font-size:11px; color:#bbbbc5; padding:4em 0 0;text-align: left;}
+footer {font-size:11px; color:#bbbbc5; padding:4em 0 0;text-align: center;}
 footer a, footer a:visited {color:#bbbbc5;}
-#breadcrumb { padding-top:34px; font-size:15px; color:#aaa;display:inline-block;float:left;}
+#breadcrumb {padding-top:34px; font-size:15px; color:#aaa;display:inline-block;float:left;}
+.breadcrumb-text {background: #fff;}
 #folder_actions {width: 50%;float:right;}
-a, a:visited { color:#00c; text-decoration: none}
+a, a:visited {color:#00c; text-decoration: none}
 a:hover {text-decoration: underline}
-.sort_hide{ display:none;}
+.sort_hide{display:none;}
 table {border-collapse: collapse;width:100%;}
+tr:hover {background: #f0f9ff}
 thead {max-width: 1024px}
-td { padding:.2em 1em .2em .2em; border-bottom:1px solid #def;height:30px; font-size:12px;white-space: nowrap;}
+td {padding:.2em 1em .2em .2em; border-bottom:1px solid #def;height:30px; font-size:12px;white-space: nowrap;}
 td.first {font-size:14px;white-space: normal;}
-td.empty { color:#777; font-style: italic; text-align: center;padding:3em 0;}
+td.empty {color:#777; font-style: italic; text-align: center;padding:3em 0;}
 .is_dir .size {color:transparent;font-size:0;}
 .is_dir .size:before {content: "--"; font-size:14px;color:#333;}
-.is_dir .download{visibility: hidden}
 a.delete {display:inline-block;
 	background: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAoAAAAKCAYAAACNMs+9AAAABGdBTUEAAK/INwWK6QAAABl0RVh0U29mdHdhcmUAQWRvYmUgSW1hZ2VSZWFkeXHJZTwAAADtSURBVHjajFC7DkFREJy9iXg0t+EHRKJDJSqRuIVaJT7AF+jR+xuNRiJyS8WlRaHWeOU+kBy7eyKhs8lkJrOzZ3OWzMAD15gxYhB+yzAm0ndez+eYMYLngdkIf2vpSYbCfsNkOx07n8kgWa1UpptNII5VR/M56Nyt6Qq33bbhQsHy6aR0WSyEyEmiCG6vR2ffB65X4HCwYC2e9CTjJGGok4/7Hcjl+ImLBWv1uCRDu3peV5eGQ2C5/P1zq4X9dGpXP+LYhmYz4HbDMQgUosWTnmQoKKf0htVKBZvtFsx6S9bm48ktaV3EXwd/CzAAVjt+gHT5me0AAAAASUVORK5CYII=) no-repeat scroll 0 2px;
 	color:#d00;	margin-left: 15px;font-size:11px;padding:0 0 0 13px;
@@ -240,7 +309,20 @@ a.delete {display:inline-block;
 .download {
 	background: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAB2klEQVR4nJ2ST2sTQRiHn5mdmj92t9XmUJIWJGq9NHrRgxQiCtqbl97FqxgaL34CP0FD8Qv07EHEU0Ew6EXEk6ci8Q9JtcXEkHR3k+zujIdUqMkmiANzmJdnHn7vzCuIWbe291tSkvhz1pr+q1L2bBwrRgvFrcZKKinfP9zI2EoKmm7Azstf3V7fXK2Wc3ujvIqzAhglwRJoS2ImQZMEBjgyoDS4hv8QGHA1WICvp9yelsA7ITBTIkwWhGBZ0Iv+MUF+c/cB8PTHt08snb+AGAACZDj8qIN6bSe/uWsBb2qV24/GBLn8yl0plY9AJ9NKeL5ICyEIQkkiZenF5XwBDAZzWItLIIR6LGfk26VVxzltJ2gFw2a0FmQLZ+bcbo/DPbcd+PrDyRb+GqRipbGlZtX92UvzjmUpEGC0JgpC3M9dL+qGz16XsvcmCgCK2/vPtTNzJ1x2kkZIRBSivh8Z2Q4+VkvZy6O8HHvWyGyITvA1qndNpxfguQNkc2CIzM0xNk5QLedCEZm1VKsf2XrAXMNrA2vVcq4ZJ4DhvCSAeSALXASuLBTW129U6oPrT969AK4Bq0AeWARs4BRgieMUEkgDmeO9ANipzDnH//nFB0KgAxwATaAFeID5DQNatLGdaXOWAAAAAElFTkSuQmCC) no-repeat scroll 0px 5px;
 	padding:4px 0 4px 20px;
+
 }
+a.delete-all {color:#ff0000; background: #ffacac; font-size:11px; float: right; border: 1px solid #d00; padding: 0px 5px; margin: 1px 10px;}
+div.sticky {position: -webkit-sticky; position: sticky; top: 0; background-color: white; font-size: 20px;}
+.picture-compress {display: inline-block; cursor: pointer; -webkit-tap-highlight-color: transparent; float: right; margin:12px 20px 0 0;}
+.picture-compress i {position: relative; display: inline-block; margin-right: .5rem; width: 46px; height: 26px; background-color: #e6e6e6; border-radius: 23px; vertical-align: middle; transition: all 0.3s linear;}
+.picture-compress i::before {content: ""; position: absolute; left: 0; width: 42px; height: 22px; background-color: #fff; border-radius: 11px; transform: translate3d(2px, 2px, 0) scale3d(1, 1, 1); transition: all 0.25s linear;}
+.picture-compress i::after {content: ""; position: absolute; left: 0; width: 22px; height: 22px; background-color: #fff; border-radius: 11px; box-shadow: 0 2px 2px rgba(0, 0, 0, 0.24); transform: translate3d(2px, 2px, 0); transition: all 0.2s ease-in-out;}
+.picture-compress:active i::after {width: 28px; transform: translate3d(2px, 2px, 0);}
+.picture-compress:active input:checked + i::after { transform: translate3d(16px, 2px, 0);}
+.picture-compress input {display: none;}
+.picture-compress input:checked + i {background-color: #007bc8;}
+.picture-compress input:checked + i::before {transform: translate3d(18px, 2px, 0) scale3d(0, 0, 0);}
+.picture-compress input:checked + i::after {transform: translate3d(22px, 2px, 0);}
 </style>
 <script src="//ajax.googleapis.com/ajax/libs/jquery/1.8.2/jquery.min.js"></script>
 <script>
@@ -299,7 +381,30 @@ $(function(){
 		},'json');
 		return false;
 	});
-
+	$("body").on("click", ".select-all", function (e) {
+		var status = $(e.target).is(":checked"); $.each($(".select-file"), function (i, v) { $(v).prop("checked", status); }); toggleButtonDeleteAllSelected();
+		return true;
+	});
+	$("body").on("click", ".select-file", function (e) {
+		$(".select-all").prop("checked", $(".select-file").length == $("input.select-file:checked").length); toggleButtonDeleteAllSelected();
+		return true;
+	});
+	function toggleButtonDeleteAllSelected() {
+		if ( $("input.select-file:checked").length ) { $(".delete-all").show(); } else { $(".delete-all").hide(); }
+		return true;
+	}
+	$("body").on("click", ".delete-all", function (e) {
+		e.preventDefault();
+		var r = confirm("Удалить все выделенные файлы?");
+		if (r == true) {
+			var listFiles = [];
+			$.each($("input.select-file:checked"), function (i,v) { listFiles.push( $(v).attr("data-file") ); });
+			if (listFiles.length) { $.post("",{'do':'delete',file:listFiles,xsrf:XSRF},function(response){ list(); },'json'); }
+			$(".delete-all").hide();
+			$(".select-all").prop("checked", false);
+		}
+		return true;
+	});
 	$('#mkdir').submit(function(e) {
 		var hashval = decodeURIComponent(window.location.hash.substr(1)),
 			$dir = $(this).find('[name=name]');
@@ -332,8 +437,6 @@ $(function(){
 			uploadFile(file);
 		});
 	});
-
-
 	function uploadFile(file) {
 		var folder = decodeURIComponent(window.location.hash.substr(1));
 
@@ -350,6 +453,7 @@ $(function(){
 		fd.append('file_data',file);
 		fd.append('file',folder);
 		fd.append('xsrf',XSRF);
+		if($('#piccompress').prop('checked')){fd.append('piccompress','True');} else {fd.append('piccompress','False');} // проверяем, поставлена ли галка "Компрессия картинок"
 		fd.append('do','upload');
 		var xhr = new XMLHttpRequest();
 		xhr.open('POST', '?');
@@ -374,7 +478,7 @@ $(function(){
 		return $row = $('<div class="error" />')
 			.append( $('<span class="fileuploadname" />').text( 'Error: ' + (folder ? folder+'/':'')+file.name))
 			.append( $('<span/>').html(' file size - <b>' + formatFileSize(file.size) + '</b>'
-				+' exceeds max upload size of <b>' + formatFileSize(MAX_UPLOAD_SIZE) + '</b>')  );
+				+' превышает максимальный размер файла в <b>' + formatFileSize(MAX_UPLOAD_SIZE) + '</b>')  );
 	}
 <?php endif; ?>
 	function list() {
@@ -386,7 +490,7 @@ $(function(){
 				$.each(data.results,function(k,v){
 					$tbody.append(renderFileRow(v));
 				});
-				!data.results.length && $tbody.append('<tr><td class="empty" colspan=5>This folder is empty</td></tr>')
+				!data.results.length && $tbody.append('<tr><td class="empty" colspan=5>Эта папка пуста</td></tr>')
 				data.is_writable ? $('body').removeClass('no_write') : $('body').addClass('no_write');
 			} else {
 				console.warn(data.error.msg);
@@ -396,13 +500,14 @@ $(function(){
 	}
 	function renderFileRow(data) {
 		var $link = $('<a class="name" />')
-			.attr('href', data.is_dir ? '#' + encodeURIComponent(data.path) : './'+ encodeURIComponent(data.path))
+			.attr('href', data.is_dir ? '#' + encodeURIComponent(data.path) : './'+ encodeURI(data.path))
+//			.attr('href', data.is_dir ? '#' + encodeURIComponent(data.path) : './'+ encodeURIComponent(data.path)) // в оригинале
 			.text(data.name);
 		var allow_direct_link = <?php echo $allow_direct_link?'true':'false'; ?>;
         	if (!data.is_dir && !allow_direct_link)  $link.css('pointer-events','none');
 		var $dl_link = $('<a/>').attr('href','?do=download&file='+ encodeURIComponent(data.path))
-			.addClass('download').text('download');
-		var $delete_link = $('<a href="#" />').attr('data-file',data.path).addClass('delete').text('delete');
+			.addClass('download').text('скачать');
+		var $delete_link = $('<a href="#" />').attr('data-file',data.path).addClass('delete').text('удалить');
 		var perms = [];
 		if(data.is_readable) perms.push('read');
 		if(data.is_writable) perms.push('write');
@@ -415,11 +520,12 @@ $(function(){
 			.append( $('<td/>').attr('data-sort',data.mtime).text(formatTimestamp(data.mtime)) )
 			.append( $('<td/>').text(perms.join('+')) )
 			.append( $('<td/>').append($dl_link).append( data.is_deleteable ? $delete_link : '') )
+			.append( $(data.is_dir ? '<td></td>' : '<td><input type="checkbox" class="select-file" data-file="'+ data.path +'"></td>') )
 		return $html;
 	}
 	function renderBreadcrumbs(path) {
 		var base = "",
-			$html = $('<div/>').append( $('<a href=#>Home</a></div>') );
+			$html = $('<div/ class="breadcrumb-text">').append( $('<a href=#>&#127968;</a></div>') );
 		$.each(path.split('%2F'),function(k,v){
 			if(v) {
 				var v_as_text = decodeURIComponent(v);
@@ -431,14 +537,14 @@ $(function(){
 		return $html;
 	}
 	function formatTimestamp(unix_timestamp) {
-		var m = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+		var m = ['Янв', 'Фев', 'Мар', 'Апр', 'Май', 'Июн', 'Июл', 'Авг', 'Сен', 'Окт', 'Ноя', 'Дек'];
 		var d = new Date(unix_timestamp*1000);
-		return [m[d.getMonth()],' ',d.getDate(),', ',d.getFullYear()," ",
-			(d.getHours() % 12 || 12),":",(d.getMinutes() < 10 ? '0' : '')+d.getMinutes(),
-			" ",d.getHours() >= 12 ? 'PM' : 'AM'].join('');
+		return [d.getDate(),' ',m[d.getMonth()],' ',d.getFullYear(),", ",
+			d.getHours(),":",(d.getMinutes() < 10 ? '0' : '')+d.getMinutes(),
+			" "].join('');
 	}
 	function formatFileSize(bytes) {
-		var s = ['bytes', 'KB','MB','GB','TB','PB','EB'];
+		var s = ['bytes', 'Kb','Mb','Gb','Tb','Pb','Eb'];
 		for(var pos = 0;bytes >= 1000; pos++,bytes /= 1024);
 		var d = Math.round(bytes*10);
 		return pos ? [parseInt(d/10),".",d%10," ",s[pos]].join('') : bytes + ' bytes';
@@ -447,35 +553,31 @@ $(function(){
 
 </script>
 </head><body>
-<div id="top">
-   <?php if($allow_create_folder): ?>
+<div id="top" class="sticky">
+	<?php if($allow_create_folder): ?>
 	<form action="?" method="post" id="mkdir" />
-		<label for=dirname>Create New Folder</label><input id=dirname type=text name=name value="" />
-		<input type="submit" value="create" />
+		<label for=dirname>Создать папку</label><input id=dirname type=text name=name value="" />
+		<input type="submit" value="Создать" />
 	</form>
+	<label class="picture-compress"><input type="checkbox" id="piccompress" name="piccompress" checked><i></i>Компрессия картинок</label>
+	<?php endif; ?>
 
-   <?php endif; ?>
+	<?php if($allow_upload): ?>
+	<div id="file_drop_target">Закинуть файлы <b>или</b><input type="file" multiple /></div>
+	<?php endif; ?>
 
-   <?php if($allow_upload): ?>
-
-	<div id="file_drop_target">
-		Drag Files Here To Upload
-		<b>or</b>
-		<input type="file" multiple />
-	</div>
-   <?php endif; ?>
+	<div style="line-height: 50px"><a href="#" class="delete-all" style="display: none; float: right;">Удалить все</a></div>
 	<div id="breadcrumb">&nbsp;</div>
 </div>
-
 <div id="upload_progress"></div>
 <table id="table"><thead><tr>
-	<th>Name</th>
-	<th>Size</th>
-	<th>Modified</th>
-	<th>Permissions</th>
-	<th>Actions</th>
+	<th>Имя</th>
+	<th>Размер</th>
+	<th>Изменен</th>
+	<th>Права</th>
+	<th>Действия</th>
+	<th width='2%'><input type="checkbox" name="" value="" class="select-all"></th>
 </tr></thead><tbody id="list">
-
 </tbody></table>
-<footer>simple php filemanager by <a href="https://github.com/jcampbell1">jcampbell1</a></footer>
+<footer>FileManager by <a href="https://github.com/jcampbell1">jcampbell1</a> and DrumScream</footer>
 </body></html>
